@@ -1,0 +1,248 @@
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import threading
+import time
+import uuid
+from network_app.crypto import identity, derive
+from network_app.shared import receive, send, encode
+from network_app.transport import Transport
+
+CHUNK = 512
+MAX_FILE = 1024 * 1024 * 1024
+
+
+class Client:
+    def __init__(self, username, host='127.0.0.1', port=9000, downloads='downloads'):
+        self.username = username
+        self.downloads = Path(downloads)
+        self.downloads.mkdir(parents=True, exist_ok=True)
+        self.events = []
+        self.lock = threading.RLock()
+        self.incoming = {}
+        self.uploads = []
+        self.outgoing = {}
+        self.file_acks = {}
+        self.users = []
+        self.revision = 0
+        self.running = False
+        self.transport = Transport(('0.0.0.0', 0), self._receive, self._failed)
+        self.socket = socket.socket()
+        self.socket.settimeout(5)
+        try:
+            self.socket.connect((host, port))
+            if receive(self.socket) != {'type': 'HELLO', 'version': 1}:
+                raise ValueError('Unsupported server')
+            private, public = identity()
+            send(self.socket, {'type': 'AUTH', 'username': username,
+                               'udp_port': self.transport.address[1], 'public_key': public})
+            response = receive(self.socket)
+            if response['type'] != 'AUTH_OK':
+                raise ValueError(response.get('error', 'Login failed'))
+            self.peer = self.transport.add(response['session'], derive(private, response['public_key']),
+                                           (socket.gethostbyname(host), response['udp_port']))
+            self.running = True
+            self.send({'type': 'READY'})
+            self.monitor = threading.Thread(target=self._heartbeat, daemon=True)
+            self.monitor.start()
+        except Exception:
+            self.transport.close()
+            self.socket.close()
+            raise
+
+    def _event(self, event):
+        with self.lock:
+            self.events.append(event)
+            if len(self.events) > 2000:
+                del self.events[:1000]
+
+    def send(self, record):
+        self.transport.send(self.peer, encode(record))
+
+    def message(self, text, recipient=None):
+        if not text.strip() or len(text.encode()) > 600:
+            raise ValueError('Message must contain 1-600 UTF-8 bytes')
+        record = {'type': 'PRIVATE_MESSAGE' if recipient else 'GLOBAL_MESSAGE',
+                  'text': text, 'id': str(uuid.uuid4()), 'recipient': recipient}
+        self.send(record)
+        if recipient:
+            self._event(dict(record, sender=self.username, timestamp=time.time()))
+        return record['id']
+
+    def send_file(self, path, recipient):
+        path = Path(path)
+        size = path.stat().st_size
+        if size > MAX_FILE:
+            raise ValueError('File exceeds 1 GiB')
+        transfer = str(uuid.uuid4())
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for block in iter(lambda: stream.read(65536), b''):
+                digest.update(block)
+        accepted = threading.Event()
+        with self.lock:
+            self.outgoing[transfer] = accepted
+            self.file_acks[transfer] = set()
+        self.send({'type': 'FILE_OFFER', 'id': transfer, 'recipient': recipient,
+                   'name': path.name, 'size': size, 'sha256': digest.hexdigest()})
+        thread = threading.Thread(target=self._upload, args=(transfer, path, recipient, accepted), daemon=True)
+        self.uploads.append(thread)
+        thread.start()
+        return transfer
+
+    def _upload(self, transfer, path, recipient, accepted):
+        try:
+            if not accepted.wait(10):
+                raise TimeoutError('File offer not accepted')
+            with path.open('rb') as stream:
+                index = 0
+                while self.running:
+                    deadline = time.monotonic() + 30
+                    while index - len(self.file_acks.get(transfer, set())) >= 16:
+                        if not self.running or time.monotonic() > deadline:
+                            raise TimeoutError("Receiver stalled")
+                        time.sleep(.01)
+                    block = stream.read(CHUNK)
+                    if not block:
+                        break
+                    self._bounded_send({'type': 'FILE_CHUNK', 'id': transfer, 'recipient': recipient,
+                                        'index': index, 'data': base64.b64encode(block).decode()})
+                    index += 1
+            self._bounded_send({'type': 'FILE_COMPLETE', 'id': transfer, 'recipient': recipient})
+        except Exception as error:
+            self._event({'type': 'ERROR', 'id': transfer, 'error': str(error)})
+        finally:
+            with self.lock:
+                self.outgoing.pop(transfer, None)
+                self.file_acks.pop(transfer, None)
+
+    def _bounded_send(self, record):
+        deadline = time.monotonic() + 30
+        while self.running and time.monotonic() < deadline:
+            with self.transport.lock:
+                queued = len(self.peer.backlog)
+            if queued < 48:
+                self.send(record)
+                return
+            time.sleep(.01)
+        raise TimeoutError('Transfer stalled')
+
+    def _receive(self, peer, payload):
+        record = json.loads(payload)
+        kind = record.get('type')
+        if kind == 'USER_LIST':
+            if record.get('revision', 0) > self.revision:
+                self.users = record['users']
+                self.revision = record['revision']
+        elif kind == 'FILE_ACK':
+            if record['id'] in self.file_acks:
+                self.file_acks[record['id']].add(record['index'])
+        elif kind == 'FILE_ACCEPT':
+            with self.lock:
+                accepted = self.outgoing.get(record['id'])
+            if accepted:
+                accepted.set()
+        elif kind == 'FILE_OFFER':
+            size = record['size']
+            transfer = str(uuid.UUID(record['id']))
+            if type(size) is not int or not 0 <= size <= MAX_FILE or len(self.incoming) >= 8:
+                return
+            key = (record['sender'], transfer)
+            if key in self.incoming:
+                return
+            name = Path(record['name'].replace('\\', '/')).name
+            if name in ('', '.', '..'):
+                name = 'file'
+            path = self.downloads / (transfer + '-' + name)
+            temp = path.with_name(path.name + '.part')
+            self.incoming[key] = dict(record, path=path, temp=temp, stream=temp.open('w+b'),
+                                      seen=set(), received=0, updated=time.monotonic())
+            self.send({'type': 'FILE_ACCEPT', 'id': transfer, 'recipient': record['sender']})
+        elif kind in ('FILE_CHUNK', 'FILE_COMPLETE'):
+            key = (record['sender'], record['id'])
+            state = self.incoming.get(key)
+            if not state:
+                return
+            state['updated'] = time.monotonic()
+            if kind == 'FILE_CHUNK':
+                index = record['index']
+                block = base64.b64decode(record['data'], validate=True)
+                count = (state['size'] + CHUNK - 1) // CHUNK
+                if type(index) is not int or not 0 <= index < count:
+                    return
+                self.send({'type': 'FILE_ACK', 'id': record['id'], 'recipient': record['sender'], 'index': index})
+                expected = min(CHUNK, state['size'] - index * CHUNK)
+                if len(block) != expected:
+                    return
+                if index not in state['seen']:
+                    state['stream'].seek(index * CHUNK)
+                    state['stream'].write(block)
+                    state['seen'].add(index)
+                    state['received'] += len(block)
+                    if len(state['seen']) % 64 == 0:
+                        self._event({'type': 'PROGRESS', 'id': record['id'], 'name': state['name'],
+                                     'progress': state['received'] / max(1, state['size'])})
+            else:
+                state['complete'] = True
+            if state.get('complete') and state['received'] == state['size']:
+                state['stream'].seek(0)
+                digest = hashlib.sha256()
+                for block in iter(lambda: state['stream'].read(65536), b''):
+                    digest.update(block)
+                state['stream'].close()
+                valid = digest.hexdigest() == state['sha256']
+                if valid:
+                    os.replace(state['temp'], state['path'])
+                else:
+                    state['temp'].unlink(missing_ok=True)
+                self.incoming.pop(key)
+                result = {'type': 'FILE_RESULT', 'id': record['id'], 'recipient': record['sender'],
+                          'success': valid, 'name': state['name'], 'sha256': digest.hexdigest()}
+                self.send(result)
+                self._event(dict(result, path=str(state['path']) if valid else None))
+            return
+        if kind != 'HEARTBEAT':
+            self._event(record)
+
+    def _failed(self, peer):
+        self._event({'type': 'ERROR', 'error': 'Reliable transport timed out'})
+        self.running = False
+
+    def _heartbeat(self):
+        while self.running:
+            try:
+                self.send({'type': 'HEARTBEAT'})
+                if time.monotonic() - self.peer.last_seen > 20:
+                    raise TimeoutError('Server unreachable')
+                for key, state in list(self.incoming.items()):
+                    if time.monotonic() - state['updated'] > 45:
+                        state['stream'].close()
+                        state['temp'].unlink(missing_ok=True)
+                        self.incoming.pop(key, None)
+                        self._event({'type': 'ERROR', 'error': 'Incoming file expired'})
+            except (OSError, ConnectionError, BufferError) as error:
+                self._event({'type': 'ERROR', 'error': str(error)})
+                self.running = False
+            time.sleep(1)
+
+    def close(self):
+        self.running = False
+        for accepted in list(self.outgoing.values()):
+            accepted.set()
+        for thread in self.uploads:
+            thread.join(2)
+        try:
+            send(self.socket, {'type': 'LOGOUT'})
+        except OSError:
+            pass
+        self.socket.close()
+        self.transport.close()
+        if hasattr(self, 'monitor'):
+            self.monitor.join(2)
+        for state in list(self.incoming.values()):
+            state['stream'].close()
+            state['temp'].unlink(missing_ok=True)
+        self.incoming.clear()
