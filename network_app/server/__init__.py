@@ -7,7 +7,7 @@ import time
 import uuid
 from network_app.crypto import identity, derive, open_password
 from .accounts import Accounts
-from network_app.shared import receive, send, encode
+from network_app.shared import AUTH_TIMEOUT, receive, send, encode
 from network_app.transport import Transport
 
 
@@ -52,7 +52,7 @@ class Server:
     def _session(self, conn, addr):
         name = None
         try:
-            conn.settimeout(5)
+            conn.settimeout(AUTH_TIMEOUT)
             private, public = identity()
             challenge = secrets.token_hex(12)
             send(conn, {'type': 'HELLO', 'version': 2,
