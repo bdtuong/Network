@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import secrets
+import shutil
 import tempfile
 import threading
 from urllib.parse import urlsplit
@@ -72,7 +73,9 @@ class Handler(BaseHTTPRequestHandler):
                     from urllib.parse import parse_qs
                     params = parse_qs(urlsplit(self.path).query)
                     name = Path(params['name'][0].replace('\\', '/')).name
-                    with tempfile.TemporaryDirectory() as folder:
+                    downloads_dir = Path(self.server.downloads)
+                    downloads_dir.mkdir(parents=True, exist_ok=True)
+                    with tempfile.TemporaryDirectory(dir=downloads_dir) as folder:
                         path = Path(folder) / name
                         with path.open('wb') as output:
                             remaining = length
@@ -83,9 +86,8 @@ class Handler(BaseHTTPRequestHandler):
                                 output.write(block)
                                 remaining -= len(block)
                         # Keep an owned spool file until the asynchronous sender finishes.
-                        spool = Path(self.server.downloads) / ('upload-' + secrets.token_hex(8) + '-' + name)
-                        spool.parent.mkdir(parents=True, exist_ok=True)
-                        path.replace(spool)
+                        spool = downloads_dir / ('upload-' + secrets.token_hex(8) + '-' + name)
+                        shutil.move(path, spool)
                         self.server.client.send_file(spool, params['recipient'][0])
                     return self.reply(200, {'ok': True})
                 if length > 16384:
