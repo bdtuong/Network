@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from network_app.crypto import identity, derive, seal_password
-from network_app.shared import receive, send, encode
+from network_app.shared import AUTH_TIMEOUT, CONNECT_TIMEOUT, receive, send, encode
 from network_app.transport import Transport
 
 CHUNK = 512
@@ -17,9 +17,11 @@ MAX_FILE = 1024 * 1024 * 1024
 
 class Client:
     def __init__(self, username, host='127.0.0.1', port=9000, downloads='downloads',
-                 *, password):
+                 *, password, connect_timeout=CONNECT_TIMEOUT, auth_timeout=AUTH_TIMEOUT):
         if not isinstance(password, str) or not 6 <= len(password) <= 128:
             raise ValueError('Password must contain 6-128 characters')
+        if connect_timeout <= 0 or auth_timeout <= 0:
+            raise ValueError('Connection and authentication timeouts must be positive')
         self.username = username
         self.downloads = Path(downloads)
         self.downloads.mkdir(parents=True, exist_ok=True)
@@ -34,9 +36,10 @@ class Client:
         self.running = False
         self.transport = Transport(('0.0.0.0', 0), self._receive, self._failed)
         self.socket = socket.socket()
-        self.socket.settimeout(5)
+        self.socket.settimeout(connect_timeout)
         try:
             self.socket.connect((host, port))
+            self.socket.settimeout(auth_timeout)
             hello = receive(self.socket)
             if hello.get('type') != 'HELLO' or hello.get('version') != 2:
                 raise ValueError('Unsupported server')
@@ -50,6 +53,7 @@ class Client:
             response = receive(self.socket)
             if response['type'] != 'AUTH_OK':
                 raise ValueError(response.get('error', 'Login failed'))
+            self.socket.settimeout(connect_timeout)
             self.peer = self.transport.add(response['session'], key,
                                            (socket.gethostbyname(host), response['udp_port']))
             self.running = True

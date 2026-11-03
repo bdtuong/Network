@@ -55,6 +55,12 @@ client.send_file('example.zip', 'Bob')
 # Then call client.close().
 ```
 
+## Concurrent login and timeouts
+
+Password hashing runs outside the account database lock, so concurrent clients do not queue behind every PBKDF2 calculation. Only short reads/inserts use the lock. SQLite's unique username constraint resolves concurrent registration: the winning account is preserved and another login must verify its password. Existing account files remain compatible; hashes still use 600,000 iterations.
+
+The TCP connect timeout defaults to 5 seconds. After connecting, HELLO/AUTH response reads use a separate 30-second authentication timeout; server-side waiting for AUTH also uses 30 seconds. The Python API can override these with `Client(..., password=..., connect_timeout=5, auth_timeout=30)`. UDP/session timeouts are unchanged. This addresses the earlier Windows trace showing a timeout waiting for AUTH_OK under 20 simultaneous logins, but Windows verification must still be repeated on the affected machine.
+
 ## LAN deployment
 
 Start the server with `--host 0.0.0.0`. Allow inbound **TCP and UDP 9000** through the server firewall. Run each HTTP bridge on its own user's computer and enter the server's LAN IP in the login form. The bridge stays on loopback; do not expose it to the LAN. Clients must have mutually routable IP/UDP ports; NAT traversal is not implemented. Use a trusted LAN/VPN because the initial key exchange has no pinned server identity.

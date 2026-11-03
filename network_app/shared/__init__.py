@@ -2,6 +2,8 @@ import json
 import struct
 
 MAX_FRAME = 16384
+CONNECT_TIMEOUT = 5
+AUTH_TIMEOUT = 30
 
 
 def encode(value):

@@ -1,4 +1,26 @@
-# Latest validation: retain chat history during file transfer
+# Latest validation: concurrent password authentication and timeouts
+
+Command: `.venv312/bin/python -m pytest -q -W error`. Actual output on macOS / Python 3.12:
+
+```text
+..............................                                           [100%]
+30 passed in 86.30s (0:01:26)
+```
+
+A focused run of password tests plus the 20-client integration test also passed: `12 passed in 26.65s`. The full suite includes 20 simultaneous TCP logins and global messaging, file transfers, impairment and private-history regressions.
+
+New regression coverage:
+
+- Barrier-synchronized password hashing ensures that concurrent registrations and existing-account verification do not hold the store lock during hashing. Tests still execute real PBKDF2 with 600,000 iterations.
+- Two registrations of one username are tested with equal/different passwords and with shared/separate Accounts objects using the same SQLite file. Exactly one insert wins. The losing login must verify the winning password; no overwrite is allowed.
+- A real localhost login with an injected 5.2-second authentication delay succeeds using the default 30-second auth wait, reproducing the timing condition that exceeded the old 5-second limit.
+- A short connection timeout and longer auth timeout work independently; an explicitly short auth timeout still raises TimeoutError. The hash strength and existing database format remain unchanged.
+
+The original Windows traceback confirmed a client timeout awaiting AUTH_OK, not a UDP delivery failure. These changes remove serialized hashing and provide a separate authentication timeout. Windows / Python 3.14 has not been executed on this host; rerun `python -m pytest -vv --tb=long tests/test_application.py::test_twenty_concurrent_clients` on the affected machine to confirm its outcome.
+
+Restart the server and all bridges after copying the updated source. Existing SQLite accounts, passwords and received files remain compatible. No dependencies were added.
+
+## Previous sender-history validation
 
 Command: `.venv312/bin/python -m pytest -q -W error`. Actual full-suite output:
 

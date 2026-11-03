@@ -10,6 +10,10 @@ import threading
 ITERATIONS = 600_000
 
 
+def _hash_password(password, salt):
+    return hashlib.pbkdf2_hmac('sha256', password.encode(), salt, ITERATIONS)
+
+
 class Accounts:
     def __init__(self, path):
         self.path = Path(path)
@@ -24,17 +28,30 @@ class Accounts:
     def authenticate(self, username, password):
         if not isinstance(password, str) or not 6 <= len(password) <= 128:
             raise ValueError('Password must contain 6-128 characters')
-        # Serialize first registration so two logins cannot claim one name.
         with self.lock, closing(sqlite3.connect(self.path)) as db:
             row = db.execute('SELECT salt, password_hash FROM accounts '
                              'WHERE username = ?', (username,)).fetchone()
-            salt = row[0] if row else os.urandom(16)
-            digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, ITERATIONS)
-            if row:
-                if not hmac.compare_digest(digest, row[1]):
-                    raise ValueError('Incorrect username or password')
-                return False
-            db.execute('INSERT INTO accounts VALUES (?, ?, ?)',
-                       (username, salt, digest))
+        if row:
+            self._verify(password, row)
+            return False
+
+        salt = os.urandom(16)
+        digest = _hash_password(password, salt)
+        with self.lock, closing(sqlite3.connect(self.path)) as db:
+            # Another login/store may have registered this name while we hashed.
+            inserted = db.execute(
+                'INSERT INTO accounts VALUES (?, ?, ?) '
+                'ON CONFLICT(username) DO NOTHING', (username, salt, digest)
+            ).rowcount
             db.commit()
-            return True
+            if inserted:
+                return True
+            row = db.execute('SELECT salt, password_hash FROM accounts '
+                             'WHERE username = ?', (username,)).fetchone()
+        self._verify(password, row)
+        return False
+
+    @staticmethod
+    def _verify(password, row):
+        if not row or not hmac.compare_digest(_hash_password(password, row[0]), row[1]):
+            raise ValueError('Incorrect username or password')
