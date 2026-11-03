@@ -38,9 +38,9 @@ class ImpairedSocket:
 
 
 def test_file_under_loss_duplication_reordering_latency(tmp_path):
-    server = Server(port=0)
-    alice = Client('Alice', port=server.port, downloads=tmp_path / 'alice')
-    bob = Client('Bob', port=server.port, downloads=tmp_path / 'bob')
+    server = Server(port=0, accounts=tmp_path / 'users.sqlite3')
+    alice = Client('Alice', password='test-password', port=server.port, downloads=tmp_path / 'alice')
+    bob = Client('Bob', password='test-password', port=server.port, downloads=tmp_path / 'bob')
     try:
         alice.transport.sock = ImpairedSocket(alice.transport.sock)
         server.transport.sock = ImpairedSocket(server.transport.sock)

@@ -7,7 +7,7 @@ import socket
 import threading
 import time
 import uuid
-from network_app.crypto import identity, derive
+from network_app.crypto import identity, derive, seal_password
 from network_app.shared import receive, send, encode
 from network_app.transport import Transport
 
@@ -16,7 +16,10 @@ MAX_FILE = 1024 * 1024 * 1024
 
 
 class Client:
-    def __init__(self, username, host='127.0.0.1', port=9000, downloads='downloads'):
+    def __init__(self, username, host='127.0.0.1', port=9000, downloads='downloads',
+                 *, password):
+        if not isinstance(password, str) or not 6 <= len(password) <= 128:
+            raise ValueError('Password must contain 6-128 characters')
         self.username = username
         self.downloads = Path(downloads)
         self.downloads.mkdir(parents=True, exist_ok=True)
@@ -34,15 +37,20 @@ class Client:
         self.socket.settimeout(5)
         try:
             self.socket.connect((host, port))
-            if receive(self.socket) != {'type': 'HELLO', 'version': 1}:
+            hello = receive(self.socket)
+            if hello.get('type') != 'HELLO' or hello.get('version') != 2:
                 raise ValueError('Unsupported server')
             private, public = identity()
+            key = derive(private, hello['public_key'])
+            encrypted_password = seal_password(key, hello['challenge'], username,
+                                               self.transport.address[1], password)
             send(self.socket, {'type': 'AUTH', 'username': username,
-                               'udp_port': self.transport.address[1], 'public_key': public})
+                               'udp_port': self.transport.address[1], 'public_key': public,
+                               'password': encrypted_password})
             response = receive(self.socket)
             if response['type'] != 'AUTH_OK':
                 raise ValueError(response.get('error', 'Login failed'))
-            self.peer = self.transport.add(response['session'], derive(private, response['public_key']),
+            self.peer = self.transport.add(response['session'], key,
                                            (socket.gethostbyname(host), response['udp_port']))
             self.running = True
             self.send({'type': 'READY'})
@@ -54,6 +62,10 @@ class Client:
             raise
 
     def _event(self, event):
+        if event.get('type') in {'PRIVATE_MESSAGE', 'FILE_OFFER', 'FILE_RESULT', 'PROGRESS'}:
+            sender = event.get('sender')
+            other = event.get('recipient') if sender == self.username else sender
+            event = dict(event, conversation=other)
         with self.lock:
             self.events.append(event)
             if len(self.events) > 2000:
@@ -113,7 +125,8 @@ class Client:
                     index += 1
             self._bounded_send({'type': 'FILE_COMPLETE', 'id': transfer, 'recipient': recipient})
         except Exception as error:
-            self._event({'type': 'ERROR', 'id': transfer, 'error': str(error)})
+            self._event({'type': 'ERROR', 'id': transfer, 'error': str(error),
+                         'conversation': recipient})
         finally:
             with self.lock:
                 self.outgoing.pop(transfer, None)
@@ -184,7 +197,8 @@ class Client:
                     state['received'] += len(block)
                     if len(state['seen']) % 64 == 0:
                         self._event({'type': 'PROGRESS', 'id': record['id'], 'name': state['name'],
-                                     'progress': state['received'] / max(1, state['size'])})
+                                     'progress': state['received'] / max(1, state['size']),
+                                     'sender': state['sender'], 'recipient': self.username})
             else:
                 state['complete'] = True
             if state.get('complete') and state['received'] == state['size']:
@@ -202,9 +216,10 @@ class Client:
                 result = {'type': 'FILE_RESULT', 'id': record['id'], 'recipient': record['sender'],
                           'success': valid, 'name': state['name'], 'sha256': digest.hexdigest()}
                 self.send(result)
-                self._event(dict(result, path=str(state['path']) if valid else None))
+                self._event(dict(result, sender=self.username,
+                                 path=str(state['path']) if valid else None))
             return
-        if kind != 'HEARTBEAT':
+        if kind in {'GLOBAL_MESSAGE', 'PRIVATE_MESSAGE', 'FILE_OFFER', 'FILE_RESULT', 'ERROR'}:
             self._event(record)
 
     def _failed(self, peer):
@@ -222,7 +237,8 @@ class Client:
                         state['stream'].close()
                         state['temp'].unlink(missing_ok=True)
                         self.incoming.pop(key, None)
-                        self._event({'type': 'ERROR', 'error': 'Incoming file expired'})
+                        self._event({'type': 'ERROR', 'id': key[1],
+                                     'conversation': key[0], 'error': 'Incoming file expired'})
             except (OSError, ConnectionError, BufferError) as error:
                 self._event({'type': 'ERROR', 'error': str(error)})
                 self.running = False

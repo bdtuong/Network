@@ -94,8 +94,10 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path == '/api/login':
                     if self.server.client:
                         self.server.client.close()
+                        self.server.client = None
                     self.server.client = Client(data['username'], data.get('host', '127.0.0.1'),
-                                                int(data.get('port', 9000)), self.server.downloads)
+                                                int(data.get('port', 9000)), self.server.downloads,
+                                                password=data['password'])
                 elif self.path == '/api/message':
                     self.server.client.message(data['text'], data.get('recipient') or None)
                 elif self.path == '/api/logout':
