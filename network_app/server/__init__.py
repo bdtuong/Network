@@ -1,16 +1,20 @@
 import json
+import secrets
 import re
 import socket
 import threading
 import time
 import uuid
-from network_app.crypto import identity, derive
+from network_app.crypto import identity, derive, open_password
+from .accounts import Accounts
 from network_app.shared import receive, send, encode
 from network_app.transport import Transport
 
 
 class Server:
-    def __init__(self, host='127.0.0.1', port=9000, timeout=15):
+    def __init__(self, host='127.0.0.1', port=9000, timeout=15,
+                 accounts='data/users.sqlite3'):
+        self.accounts = Accounts(accounts)
         self.lock = threading.RLock()
         self.users = {}
         self.revision = 0
@@ -49,7 +53,10 @@ class Server:
         name = None
         try:
             conn.settimeout(5)
-            send(conn, {'type': 'HELLO', 'version': 1})
+            private, public = identity()
+            challenge = secrets.token_hex(12)
+            send(conn, {'type': 'HELLO', 'version': 2,
+                        'public_key': public, 'challenge': challenge})
             request = receive(conn)
             candidate = request.get('username', '')
             if request.get('type') != 'AUTH' or not re.fullmatch(r'[A-Za-z0-9_-]{1,24}', candidate):
@@ -57,8 +64,10 @@ class Server:
             port = request['udp_port']
             if type(port) is not int or not 1 <= port <= 65535:
                 raise ValueError('Invalid UDP port')
-            private, public = identity()
             key = derive(private, request['public_key'])
+            password = open_password(key, challenge, candidate, port, request['password'])
+            self.accounts.authenticate(candidate, password)
+            del password
             with self.lock:
                 if candidate in self.users:
                     raise ValueError('Username already online')
@@ -126,7 +135,8 @@ class Server:
             else:
                 target = self.users.get(request.get('recipient'))
                 if not target:
-                    self.transport.send(peer, encode({'type': 'ERROR', 'error': 'Recipient offline', 'id': request.get('id')}))
+                    self.transport.send(peer, encode({'type': 'ERROR', 'error': 'Recipient offline', 'id': request.get('id'),
+                                                       'conversation': request.get('recipient')}))
                     return
                 targets = [target]
             payload = encode(request)
@@ -134,7 +144,9 @@ class Server:
                 try:
                     self.transport.send(target['peer'], payload)
                 except (BufferError, ConnectionError):
-                    self.transport.send(peer, encode({'type': 'ERROR', 'error': 'Recipient congested'}))
+                    self.transport.send(peer, encode({'type': 'ERROR', 'error': 'Recipient congested',
+                                                       'id': request.get('id'),
+                                                       'conversation': request.get('recipient')}))
 
     def close(self):
         self.running = False

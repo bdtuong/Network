@@ -6,8 +6,8 @@ from test_application import wait
 
 
 def test_session_inactivity_expiry(tmp_path):
-    server = Server(port=0, timeout=.3)
-    client = Client('Idle', port=server.port, downloads=tmp_path)
+    server = Server(port=0, timeout=.3, accounts=tmp_path / 'users.sqlite3')
+    client = Client('Idle', password='test-password', port=server.port, downloads=tmp_path)
     try:
         client.running = False
         wait(lambda: not server.users, 4)
@@ -17,8 +17,8 @@ def test_session_inactivity_expiry(tmp_path):
 
 
 def test_retry_exhaustion_signals_failure_and_cleans_queue(tmp_path):
-    server = Server(port=0)
-    client = Client('Retry', port=server.port, downloads=tmp_path)
+    server = Server(port=0, accounts=tmp_path / 'users.sqlite3')
+    client = Client('Retry', password='test-password', port=server.port, downloads=tmp_path)
     try:
         wait(lambda: client.transport.idle(client.peer))
         with client.transport.lock:
@@ -33,8 +33,8 @@ def test_retry_exhaustion_signals_failure_and_cleans_queue(tmp_path):
 
 
 def test_window_bounds_and_oversized_send(tmp_path):
-    server = Server(port=0)
-    client = Client('Window', port=server.port, downloads=tmp_path)
+    server = Server(port=0, accounts=tmp_path / 'users.sqlite3')
+    client = Client('Window', password='test-password', port=server.port, downloads=tmp_path)
     try:
         import pytest
         with pytest.raises(ValueError):

@@ -29,10 +29,10 @@ def wait(predicate, timeout=15):
 
 @pytest.fixture
 def system(tmp_path):
-    server = Server(port=0)
+    server = Server(port=0, accounts=tmp_path / 'users.sqlite3')
     clients = []
     def connect(name):
-        client = Client(name, port=server.port, downloads=tmp_path / name)
+        client = Client(name, password='test-password', port=server.port, downloads=tmp_path / name)
         clients.append(client)
         return client
     yield server, connect
@@ -160,3 +160,48 @@ def test_abrupt_disconnect_and_shutdown(system):
     wait(lambda: any(e.get('text') == 'still works' for e in bob.events))
     server.close()
     assert not server.thread.is_alive()
+
+
+def test_private_file_events_are_scoped_to_other_participant(system, tmp_path):
+    server, connect = system
+    alice, bob, charlie = [connect(name) for name in ('Alice', 'Bob', 'Charlie')]
+    path = tmp_path / 'private.bin'
+    path.write_bytes(os.urandom(70000))
+    transfer = alice.send_file(path, 'Bob')
+    wait(lambda: any(e['type'] == 'FILE_RESULT' and e.get('id') == transfer
+                     for e in alice.events))
+    bob_events = [e for e in bob.events if e.get('id') == transfer]
+    visible = [e for e in bob_events if e['type'] in {'FILE_OFFER', 'PROGRESS', 'FILE_RESULT'}]
+    assert {e['type'] for e in visible} == {'FILE_OFFER', 'PROGRESS', 'FILE_RESULT'}
+    assert all(e['conversation'] == 'Alice' for e in visible)
+    assert all(e['sender'] == 'Alice' and e['recipient'] == 'Bob'
+               for e in visible if e['type'] in {'FILE_OFFER', 'PROGRESS'})
+    result = next(e for e in visible if e['type'] == 'FILE_RESULT')
+    assert result['success']
+    assert result['sender'] == 'Bob'
+    assert Path(result['path']).read_bytes() == path.read_bytes()
+    sender_result = next(e for e in alice.events
+                         if e['type'] == 'FILE_RESULT' and e.get('id') == transfer)
+    assert sender_result['conversation'] == 'Bob'
+    assert not any(e.get('id') == transfer for e in charlie.events)
+    alice.message('still global')
+    wait(lambda: any(e.get('text') == 'still global' for e in charlie.events))
+    assert not any(e.get('id') == transfer for e in charlie.events)
+
+
+
+def test_sender_retains_private_message_after_large_file_without_polling(system, tmp_path):
+    server, connect = system
+    alice, bob = connect('Alice'), connect('Bob')
+    message_id = alice.message('hello', 'Bob')
+    wait(lambda: any(e.get('id') == message_id for e in bob.events))
+    path = tmp_path / 'large-private.bin'
+    path.write_bytes(os.urandom(1200 * 1024))
+    transfer = alice.send_file(path, 'Bob')
+    result = wait(lambda: next((e for e in alice.events
+                               if e.get('id') == transfer and e['type'] == 'FILE_RESULT'), None), 60)
+    assert result['success']
+    assert any(e.get('id') == message_id and e['text'] == 'hello' for e in alice.events)
+    assert any(e.get('id') == message_id for e in bob.events)
+    assert not any(e['type'] in {'FILE_ACK', 'FILE_ACCEPT', 'FILE_CHUNK'}
+                   for e in alice.events + bob.events)

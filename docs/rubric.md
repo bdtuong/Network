@@ -6,7 +6,7 @@ Status describes implementation and automated local evidence, not an instructor'
 |---|---|---|---|---|
 | 1 | Setup and protocol | `shared`, `docs/protocol.md`; framing, packet layout, state/sequence diagrams | framing and invalid-length tests; inspect protocol | Implemented; chronology caveat below |
 | 2 | TCP handshake | `server._session`, `client.Client` | login/integration tests; launch three bridges | Verified locally |
-| 3 | Authentication and state | unique nicknames, IP/TCP/UDP tracking, UUID sessions, presence revision | duplicate login, online list, logout and inactivity tests | Verified locally; nickname admission only |
+| 3 | Authentication and state | persistent password accounts, IP/TCP/UDP tracking, UUID sessions, presence revision | password/restart/replay tests, duplicate login, online list, logout and inactivity tests | Verified locally; first-login registration, trusted LAN |
 | 4 | Concurrency | thread per TCP session, independent UDP reactor/worker | 20 concurrent clients and 20 simultaneous senders | Verified locally |
 | 5 | UDP streaming routing | global/private records, independent file IDs, selective delivery | private isolation, global broadcast, concurrent chat/file test | Verified locally; chat arrival ordered |
 | 6 | Reliable UDP file transfer | chunks, selective repeat, receiver credits, disk reassembly, SHA-256 | empty/37-byte/65,539-byte/10,485,791-byte files; deterministic impairment | Verified locally |

@@ -1,4 +1,47 @@
-# Observed validation
+# Latest validation: retain chat history during file transfer
+
+Command: `.venv312/bin/python -m pytest -q -W error`. Actual full-suite output:
+
+```text
+.......................                                                  [100%]
+23 passed in 70.54s (0:01:10)
+```
+
+The sender-history regression sends a private `hello` from Alice to Bob, transfers 1,228,800 bytes (2,400 chunks), and verifies that both parties retain the message, the file verifies successfully, and FILE_ACK/FILE_ACCEPT/FILE_CHUNK never enter UI event queues. It deliberately does not poll/drain events while the file is transferred.
+
+The JavaScript suite now has six cases. Its new case renders `hello`, ingests 2,500 control ACK events plus 1,250 progress updates across multiple batches, then appends FILE_RESULT and verifies that hello, one latest progress item and Verified all remain visible. Switching to Global hides these private records and switching back restores them. This tests the actual frontend rendering/history functions with a lightweight DOM harness, not a manual browser session.
+
+Restart Python bridges (and the server if still on an older version), then reopen the full terminal token URLs to load the new Python and JavaScript. Old messages already evicted by the previous implementation cannot be recovered from that in-memory history.
+
+## Previous conversation-isolation validation
+
+Command: `.venv312/bin/python -m pytest -q -W error`. Actual output:
+
+```text
+......................                                                   [100%]
+22 passed in 65.19s (0:01:05)
+```
+
+The new real-socket test transfers a 70,000-byte file from Alice to Bob while Charlie is online. It verifies that Bob's file offer/progress/result events all identify Alice as the conversation, Alice's result identifies Bob, received bytes match, and Charlie receives no event for this transfer. Global messaging still reaches Charlie afterward.
+
+Five JavaScript regression cases execute the real `app.js` renderer in Node's VM with a small DOM test harness: file events are hidden in Global and Charlie, visible in Alice, channel switching restores the matching history, and internal/unscoped events are not rendered as private cards. `node --test tests/test_web.cjs` passed all five cases; pytest invokes this suite when Node.js is available. No tests were skipped in the latest local run. This is automated rendering evidence, not a claim of a new manual browser demonstration.
+
+Restart server and all Python bridges, then open each full URL including its token so both Python event metadata and JavaScript filters are refreshed. Existing accounts and downloaded files are preserved.
+
+## Previous password-update validation
+
+Latest command: `.venv312/bin/python -m pytest -q -W error`. Actual full-run output:
+
+```text
+....................                                                     [100%]
+20 passed in 63.58s (0:01:03)
+```
+
+Output is also saved in `pytest-results.txt`. A subsequent focused HTTP bridge test (including wrong-password feedback) passed: `1 passed in 2.84s`. New tests cover salted account hashes, persistence across server restart, wrong and short passwords, credential encryption, identity/challenge binding, old AUTH replay rejection and plaintext password rejection. Existing integration tests now pass passwords and use isolated temporary SQLite account stores. No user account database is touched by tests.
+
+The bridge integration test submits the password through the same HTTP endpoint used by the UI. Manual password-field browser interaction has not been repeated; `browser-smoke.png` is historical evidence from the earlier nickname-only UI, not a screenshot of the new password form. Old servers/bridges must be restarted and browser pages reloaded with the new terminal token URLs.
+
+## Previous verification (before password update)
 
 Date: 2026-10-30. Host: macOS arm64. Runtime: Python 3.12.14. Dependencies installed in `.venv312`: cryptography 50.0.2, pytest 9.2.0, reportlab 5.1.0.
 
