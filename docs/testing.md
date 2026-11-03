@@ -1,4 +1,28 @@
-# Latest validation: concurrent password authentication and timeouts
+# Latest validation: transfer and shutdown race conditions
+
+Command: `.venv312/bin/python -m pytest -q -W error`. Actual result on macOS / Python 3.12:
+
+```text
+....................................                                     [100%]
+36 passed in 90.39s (0:01:30)
+```
+
+Six new tests in `tests/test_races.py` force specific interleavings with threading events and paused wrappers around real file/socket operations:
+
+1. Expiry skips an actively written file and rechecks freshness on later passes, leaving heartbeat free to run. The file subsequently completes and matches its content hash.
+2. Expiry holds the transfer file lock while disposing a stale partial; a concurrent late chunk waits and then sees the closed flag rather than writing to a closed stream. Exactly one expiry error is emitted.
+3. Client disconnect and an in-progress write serialize through the same transfer lock. The partial is removed after the writer exits.
+4. ACK lookup/update and outgoing-transfer removal use the same client lock. Cleanup waits for the update; an ACK arriving after removal is ignored without recreating state.
+5. A real TCP accept pauses after returning a socket while server shutdown snapshots connections. Resuming accept closes that socket without registering/starting a session. EOF or reset is accepted as the peer-close outcome across platforms.
+6. A real TCP login pauses during password authentication while shutdown starts. Finishing authentication cannot call transport.add or publish a new session; sockets/session threads are cleaned up in the test.
+
+Per-file locking covers writes, hash verification/finalization and disposal; the client-wide lock is not held during file hashing or while acquiring a file lock. Expiry uses a nonblocking file-lock attempt and revisits busy transfers later. Server peer removal now uses the transport lock and clears queued/pending packets. Client/server close calls are serialized and transfer/thread registration checks stopping state before publication.
+
+The full suite also covers password-registration races, slow authentication, 20 clients, impaired UDP files and private-history regressions. This run is macOS evidence, not a new Windows test result. Remaining general limits include bounded thread joins and no ability to forcibly interrupt a password hash already executing. No claim is made that every possible concurrency issue has been eliminated.
+
+Restart server and Python bridges to load the fixes. Existing accounts/password hashes and downloaded files are unchanged. No dependencies or protocol-version changes were required.
+
+## Previous authentication-concurrency validation
 
 Command: `.venv312/bin/python -m pytest -q -W error`. Actual output on macOS / Python 3.12:
 

@@ -60,6 +60,14 @@ class Transport:
             self.peers[session] = peer
             return peer
 
+    def remove(self, session):
+        with self.lock:
+            peer = self.peers.pop(session, None)
+            if peer is not None:
+                peer.failed = True
+                peer.pending.clear()
+                peer.backlog.clear()
+
     def send(self, peer, payload):
         if len(payload) + HEADER.size + 16 > MAX_PACKET:
             raise ValueError('UDP payload too large')

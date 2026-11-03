@@ -76,6 +76,14 @@ If Node.js is installed, pytest also runs the JavaScript conversation-rendering 
 
 Tests use real ephemeral localhost sockets and deterministic outbound loss (every 11th packet), duplication (every 5th), reordering (every 7th) and 1 ms latency. They include 20 concurrent clients, simultaneous global messages, private isolation, empty/text/binary/>10 MiB transfers, concurrent chat, hash mismatch rejection, replay rejection, malformed packets, bridge authorization, disconnects and cleanup. See `docs/testing.md` for actual observed results.
 
+Race regressions can also be run alone:
+
+```sh
+python -m pytest -q -W error tests/test_races.py
+```
+
+They pause real file operations, ACK lookup, TCP accept and authentication with threading events to force transfer-cleanup/shutdown interleavings, rather than relying only on a stress run to trigger them.
+
 ## Architecture and report
 
 - `network_app/server/`: TCP admission, session tracking and UDP routing.

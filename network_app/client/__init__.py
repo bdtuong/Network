@@ -27,6 +27,8 @@ class Client:
         self.downloads.mkdir(parents=True, exist_ok=True)
         self.events = []
         self.lock = threading.RLock()
+        self._close_lock = threading.Lock()
+        self._closing = threading.Event()
         self.incoming = {}
         self.uploads = []
         self.outgoing = {}
@@ -100,14 +102,30 @@ class Client:
                 digest.update(block)
         accepted = threading.Event()
         with self.lock:
+            if self._closing.is_set() or not self.running:
+                raise ConnectionError('Client is closing')
             self.outgoing[transfer] = accepted
             self.file_acks[transfer] = set()
-        self.send({'type': 'FILE_OFFER', 'id': transfer, 'recipient': recipient,
-                   'name': path.name, 'size': size, 'sha256': digest.hexdigest()})
-        thread = threading.Thread(target=self._upload, args=(transfer, path, recipient, accepted), daemon=True)
-        self.uploads.append(thread)
-        thread.start()
+            try:
+                self.send({'type': 'FILE_OFFER', 'id': transfer, 'recipient': recipient,
+                           'name': path.name, 'size': size, 'sha256': digest.hexdigest()})
+                thread = threading.Thread(target=self._upload,
+                                          args=(transfer, path, recipient, accepted), daemon=True)
+                thread.start()
+                self.uploads.append(thread)
+            except Exception:
+                self._forget_upload(transfer)
+                raise
         return transfer
+
+    def _forget_upload(self, transfer):
+        with self.lock:
+            self.outgoing.pop(transfer, None)
+            self.file_acks.pop(transfer, None)
+
+    def _ack_count(self, transfer):
+        with self.lock:
+            return len(self.file_acks.get(transfer, ()))
 
     def _upload(self, transfer, path, recipient, accepted):
         try:
@@ -117,7 +135,7 @@ class Client:
                 index = 0
                 while self.running:
                     deadline = time.monotonic() + 30
-                    while index - len(self.file_acks.get(transfer, set())) >= 16:
+                    while index - self._ack_count(transfer) >= 16:
                         if not self.running or time.monotonic() > deadline:
                             raise TimeoutError("Receiver stalled")
                         time.sleep(.01)
@@ -132,9 +150,7 @@ class Client:
             self._event({'type': 'ERROR', 'id': transfer, 'error': str(error),
                          'conversation': recipient})
         finally:
-            with self.lock:
-                self.outgoing.pop(transfer, None)
-                self.file_acks.pop(transfer, None)
+            self._forget_upload(transfer)
 
     def _bounded_send(self, record):
         deadline = time.monotonic() + 30
@@ -148,49 +164,71 @@ class Client:
         raise TimeoutError('Transfer stalled')
 
     def _receive(self, peer, payload):
+        if self._closing.is_set():
+            return
         record = json.loads(payload)
         kind = record.get('type')
         if kind == 'USER_LIST':
-            if record.get('revision', 0) > self.revision:
-                self.users = record['users']
-                self.revision = record['revision']
+            with self.lock:
+                if record.get('revision', 0) > self.revision:
+                    self.users = record['users']
+                    self.revision = record['revision']
         elif kind == 'FILE_ACK':
-            if record['id'] in self.file_acks:
-                self.file_acks[record['id']].add(record['index'])
+            with self.lock:
+                acknowledged = self.file_acks.get(record['id'])
+                if acknowledged is not None:
+                    acknowledged.add(record['index'])
         elif kind == 'FILE_ACCEPT':
             with self.lock:
                 accepted = self.outgoing.get(record['id'])
             if accepted:
                 accepted.set()
         elif kind == 'FILE_OFFER':
-            size = record['size']
-            transfer = str(uuid.UUID(record['id']))
-            if type(size) is not int or not 0 <= size <= MAX_FILE or len(self.incoming) >= 8:
-                return
-            key = (record['sender'], transfer)
-            if key in self.incoming:
-                return
-            name = Path(record['name'].replace('\\', '/')).name
-            if name in ('', '.', '..'):
-                name = 'file'
-            path = self.downloads / (transfer + '-' + name)
-            temp = path.with_name(path.name + '.part')
-            self.incoming[key] = dict(record, path=path, temp=temp, stream=temp.open('w+b'),
-                                      seen=set(), received=0, updated=time.monotonic())
-            self.send({'type': 'FILE_ACCEPT', 'id': transfer, 'recipient': record['sender']})
+            self._receive_offer(record)
+            return
         elif kind in ('FILE_CHUNK', 'FILE_COMPLETE'):
-            key = (record['sender'], record['id'])
+            self._receive_file(record)
+            return
+        if kind in {'GLOBAL_MESSAGE', 'PRIVATE_MESSAGE', 'FILE_RESULT', 'ERROR'}:
+            self._event(record)
+
+    def _receive_offer(self, record):
+        size = record['size']
+        transfer = str(uuid.UUID(record['id']))
+        if type(size) is not int or not 0 <= size <= MAX_FILE:
+            return
+        key = (record['sender'], transfer)
+        name = Path(record['name'].replace('\\', '/')).name
+        if name in ('', '.', '..'):
+            name = 'file'
+        path = self.downloads / (transfer + '-' + name)
+        temp = path.with_name(path.name + '.part')
+        with self.lock:
+            if self._closing.is_set() or key in self.incoming or len(self.incoming) >= 8:
+                return
+            self.incoming[key] = dict(record, path=path, temp=temp, stream=temp.open('w+b'),
+                                      seen=set(), received=0, updated=time.monotonic(),
+                                      lock=threading.RLock(), closed=False)
+        self.send({'type': 'FILE_ACCEPT', 'id': transfer, 'recipient': record['sender']})
+        self._event(record)
+
+    def _receive_file(self, record):
+        key = (record['sender'], record['id'])
+        with self.lock:
             state = self.incoming.get(key)
-            if not state:
+        if state is None:
+            return
+        # Never hold the client-wide lock while waiting for a file lock or hashing.
+        with state['lock']:
+            if state['closed'] or self._closing.is_set():
                 return
             state['updated'] = time.monotonic()
-            if kind == 'FILE_CHUNK':
+            if record['type'] == 'FILE_CHUNK':
                 index = record['index']
                 block = base64.b64decode(record['data'], validate=True)
                 count = (state['size'] + CHUNK - 1) // CHUNK
                 if type(index) is not int or not 0 <= index < count:
                     return
-                self.send({'type': 'FILE_ACK', 'id': record['id'], 'recipient': record['sender'], 'index': index})
                 expected = min(CHUNK, state['size'] - index * CHUNK)
                 if len(block) != expected:
                     return
@@ -203,6 +241,8 @@ class Client:
                         self._event({'type': 'PROGRESS', 'id': record['id'], 'name': state['name'],
                                      'progress': state['received'] / max(1, state['size']),
                                      'sender': state['sender'], 'recipient': self.username})
+                self.send({'type': 'FILE_ACK', 'id': record['id'],
+                           'recipient': record['sender'], 'index': index})
             else:
                 state['complete'] = True
             if state.get('complete') and state['received'] == state['size']:
@@ -216,15 +256,41 @@ class Client:
                     os.replace(state['temp'], state['path'])
                 else:
                     state['temp'].unlink(missing_ok=True)
-                self.incoming.pop(key)
+                state['closed'] = True
+                with self.lock:
+                    self.incoming.pop(key, None)
                 result = {'type': 'FILE_RESULT', 'id': record['id'], 'recipient': record['sender'],
                           'success': valid, 'name': state['name'], 'sha256': digest.hexdigest()}
                 self.send(result)
                 self._event(dict(result, sender=self.username,
                                  path=str(state['path']) if valid else None))
-            return
-        if kind in {'GLOBAL_MESSAGE', 'PRIVATE_MESSAGE', 'FILE_OFFER', 'FILE_RESULT', 'ERROR'}:
-            self._event(record)
+
+    def _discard_incoming(self, key, state):
+        with state['lock']:
+            if state['closed']:
+                return
+            state['closed'] = True
+            state['stream'].close()
+            state['temp'].unlink(missing_ok=True)
+            with self.lock:
+                if self.incoming.get(key) is state:
+                    self.incoming.pop(key)
+
+    def _expire_incoming(self):
+        with self.lock:
+            transfers = list(self.incoming.items())
+        for key, state in transfers:
+            # A busy transfer must not stall the heartbeat thread.
+            if not state['lock'].acquire(blocking=False):
+                continue
+            try:
+                if state['closed'] or time.monotonic() - state['updated'] <= 45:
+                    continue
+                self._discard_incoming(key, state)
+                self._event({'type': 'ERROR', 'id': key[1],
+                             'conversation': key[0], 'error': 'Incoming file expired'})
+            finally:
+                state['lock'].release()
 
     def _failed(self, peer):
         self._event({'type': 'ERROR', 'error': 'Reliable transport timed out'})
@@ -236,33 +302,34 @@ class Client:
                 self.send({'type': 'HEARTBEAT'})
                 if time.monotonic() - self.peer.last_seen > 20:
                     raise TimeoutError('Server unreachable')
-                for key, state in list(self.incoming.items()):
-                    if time.monotonic() - state['updated'] > 45:
-                        state['stream'].close()
-                        state['temp'].unlink(missing_ok=True)
-                        self.incoming.pop(key, None)
-                        self._event({'type': 'ERROR', 'id': key[1],
-                                     'conversation': key[0], 'error': 'Incoming file expired'})
+                self._expire_incoming()
             except (OSError, ConnectionError, BufferError) as error:
                 self._event({'type': 'ERROR', 'error': str(error)})
                 self.running = False
             time.sleep(1)
 
     def close(self):
-        self.running = False
-        for accepted in list(self.outgoing.values()):
-            accepted.set()
-        for thread in self.uploads:
-            thread.join(2)
-        try:
-            send(self.socket, {'type': 'LOGOUT'})
-        except OSError:
-            pass
-        self.socket.close()
-        self.transport.close()
-        if hasattr(self, 'monitor'):
-            self.monitor.join(2)
-        for state in list(self.incoming.values()):
-            state['stream'].close()
-            state['temp'].unlink(missing_ok=True)
-        self.incoming.clear()
+        with self._close_lock:
+            if self._closing.is_set():
+                return
+            with self.lock:
+                self._closing.set()
+                self.running = False
+                accepted_events = list(self.outgoing.values())
+                uploads = list(self.uploads)
+            for accepted in accepted_events:
+                accepted.set()
+            for thread in uploads:
+                thread.join(2)
+            try:
+                send(self.socket, {'type': 'LOGOUT'})
+            except OSError:
+                pass
+            self.socket.close()
+            self.transport.close()
+            if hasattr(self, 'monitor'):
+                self.monitor.join(2)
+            with self.lock:
+                transfers = list(self.incoming.items())
+            for key, state in transfers:
+                self._discard_incoming(key, state)
