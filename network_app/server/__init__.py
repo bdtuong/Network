@@ -16,6 +16,7 @@ class Server:
                  accounts='data/users.sqlite3'):
         self.accounts = Accounts(accounts)
         self.lock = threading.RLock()
+        self._close_lock = threading.Lock()
         self.users = {}
         self.revision = 0
         self.connections = set()
@@ -44,10 +45,13 @@ class Server:
             except OSError:
                 break
             with self.lock:
+                if not self.running:
+                    conn.close()
+                    break
                 self.connections.add(conn)
-            thread = threading.Thread(target=self._session, args=(conn, addr), daemon=True)
-            self.threads.append(thread)
-            thread.start()
+                thread = threading.Thread(target=self._session, args=(conn, addr), daemon=True)
+                self.threads.append(thread)
+                thread.start()
 
     def _session(self, conn, addr):
         name = None
@@ -69,6 +73,8 @@ class Server:
             self.accounts.authenticate(candidate, password)
             del password
             with self.lock:
+                if not self.running:
+                    raise ConnectionError('Server is shutting down')
                 if candidate in self.users:
                     raise ValueError('Username already online')
                 sid = str(uuid.uuid4())
@@ -97,13 +103,15 @@ class Server:
                 if name:
                     user = self.users.pop(name, None)
                     if user:
-                        self.transport.peers.pop(user['peer'].session, None)
+                        self.transport.remove(user['peer'].session)
                 self.connections.discard(conn)
             conn.close()
             self.presence()
 
     def presence(self):
         with self.lock:
+            if not self.running:
+                return
             self.revision += 1
             payload = encode({'type': 'USER_LIST', 'revision': self.revision,
                               'users': [{'username': n} for n in self.users]})
@@ -116,6 +124,8 @@ class Server:
     def route(self, peer, data):
         request = json.loads(data)
         with self.lock:
+            if not self.running:
+                return
             sender = next((n for n, u in self.users.items() if u['peer'] is peer), None)
             if not sender:
                 return
@@ -149,17 +159,21 @@ class Server:
                                                        'conversation': request.get('recipient')}))
 
     def close(self):
-        self.running = False
-        self.sock.close()
-        with self.lock:
-            connections = list(self.connections)
-        for conn in connections:
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            conn.close()
-        self.thread.join(2)
-        for thread in self.threads:
-            thread.join(2)
-        self.transport.close()
+        with self._close_lock:
+            with self.lock:
+                if not self.running:
+                    return
+                self.running = False
+                connections = list(self.connections)
+                threads = list(self.threads)
+            self.sock.close()
+            for conn in connections:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                conn.close()
+            self.thread.join(2)
+            for thread in threads:
+                thread.join(2)
+            self.transport.close()
