@@ -131,6 +131,8 @@ class Client:
         try:
             if not accepted.wait(10):
                 raise TimeoutError('File offer not accepted')
+            size = path.stat().st_size
+            count = (size + CHUNK - 1) // CHUNK
             with path.open('rb') as stream:
                 index = 0
                 while self.running:
@@ -145,7 +147,14 @@ class Client:
                     self._bounded_send({'type': 'FILE_CHUNK', 'id': transfer, 'recipient': recipient,
                                         'index': index, 'data': base64.b64encode(block).decode()})
                     index += 1
+                    if index == 1 or index % 64 == 0:
+                        self._event({'type': 'PROGRESS', 'id': transfer, 'name': path.name,
+                                     'progress': index / max(1, count),
+                                     'sender': self.username, 'recipient': recipient})
             self._bounded_send({'type': 'FILE_COMPLETE', 'id': transfer, 'recipient': recipient})
+            self._event({'type': 'PROGRESS', 'id': transfer, 'name': path.name,
+                         'progress': 1.0,
+                         'sender': self.username, 'recipient': recipient})
         except Exception as error:
             self._event({'type': 'ERROR', 'id': transfer, 'error': str(error),
                          'conversation': recipient})
@@ -237,7 +246,7 @@ class Client:
                     state['stream'].write(block)
                     state['seen'].add(index)
                     state['received'] += len(block)
-                    if len(state['seen']) % 64 == 0:
+                    if len(state['seen']) == 1 or len(state['seen']) % 64 == 0:
                         self._event({'type': 'PROGRESS', 'id': record['id'], 'name': state['name'],
                                      'progress': state['received'] / max(1, state['size']),
                                      'sender': state['sender'], 'recipient': self.username})
@@ -246,6 +255,9 @@ class Client:
             else:
                 state['complete'] = True
             if state.get('complete') and state['received'] == state['size']:
+                self._event({'type': 'PROGRESS', 'id': record['id'], 'name': state['name'],
+                             'progress': 1.0,
+                             'sender': state['sender'], 'recipient': self.username})
                 state['stream'].seek(0)
                 digest = hashlib.sha256()
                 for block in iter(lambda: state['stream'].read(65536), b''):
