@@ -133,13 +133,33 @@ class Client:
                 raise TimeoutError('File offer not accepted')
             size = path.stat().st_size
             count = (size + CHUNK - 1) // CHUNK
+            reported = -1
+
+            def report_progress():
+                nonlocal reported
+                with self.lock:
+                    acknowledged = self.file_acks.get(transfer, set())
+                    received_chunks = len(acknowledged)
+                    received = received_chunks * CHUNK
+                    if count and count - 1 in acknowledged:
+                        received -= CHUNK - (size - (count - 1) * CHUNK)
+                if received_chunks != reported and (
+                    reported < 1 or received_chunks == count or received_chunks - reported >= 64
+                ):
+                    self._event({'type': 'PROGRESS', 'id': transfer, 'name': path.name,
+                                 'progress': min(size, received) / size if size else 0,
+                                 'phase': 'received', 'sender': self.username,
+                                 'recipient': recipient})
+                    reported = received_chunks
+                return received_chunks
+
             with path.open('rb') as stream:
                 index = 0
                 while self.running:
                     deadline = time.monotonic() + 30
-                    while index - self._ack_count(transfer) >= 16:
+                    while index - report_progress() >= 16:
                         if not self.running or time.monotonic() > deadline:
-                            raise TimeoutError("Receiver stalled")
+                            raise TimeoutError('Receiver stalled')
                         time.sleep(.01)
                     block = stream.read(CHUNK)
                     if not block:
@@ -147,14 +167,12 @@ class Client:
                     self._bounded_send({'type': 'FILE_CHUNK', 'id': transfer, 'recipient': recipient,
                                         'index': index, 'data': base64.b64encode(block).decode()})
                     index += 1
-                    if index == 1 or index % 64 == 0:
-                        self._event({'type': 'PROGRESS', 'id': transfer, 'name': path.name,
-                                     'progress': index / max(1, count),
-                                     'sender': self.username, 'recipient': recipient})
+            deadline = time.monotonic() + 30
+            while report_progress() < count:
+                if not self.running or time.monotonic() > deadline:
+                    raise TimeoutError('Receiver stalled')
+                time.sleep(.01)
             self._bounded_send({'type': 'FILE_COMPLETE', 'id': transfer, 'recipient': recipient})
-            self._event({'type': 'PROGRESS', 'id': transfer, 'name': path.name,
-                         'progress': 1.0,
-                         'sender': self.username, 'recipient': recipient})
         except Exception as error:
             self._event({'type': 'ERROR', 'id': transfer, 'error': str(error),
                          'conversation': recipient})
@@ -198,6 +216,10 @@ class Client:
         elif kind in ('FILE_CHUNK', 'FILE_COMPLETE'):
             self._receive_file(record)
             return
+        if kind == 'FILE_RESULT' and record.get('success'):
+            self._event({'type': 'PROGRESS', 'id': record['id'], 'name': record['name'],
+                         'progress': 1.0, 'phase': 'verified',
+                         'sender': self.username, 'recipient': record['sender']})
         if kind in {'GLOBAL_MESSAGE', 'PRIVATE_MESSAGE', 'FILE_RESULT', 'ERROR'}:
             self._event(record)
 

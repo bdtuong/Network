@@ -42,6 +42,8 @@ class Transport:
         self.sock.settimeout(.02)
         self.callback, self.failure = callback, failure
         self.peers = {}
+        self.metrics = dict.fromkeys(('packets_in', 'packets_out', 'bytes_in', 'bytes_out',
+                                      'acks_in', 'acks_out', 'retransmissions'), 0)
         self.lock = threading.RLock()
         self.running = True
         self.events = queue.Queue(maxsize=8192)
@@ -78,12 +80,23 @@ class Transport:
                 raise BufferError('Send queue full')
             peer.backlog.append(payload)
 
+    def snapshot_metrics(self):
+        with self.lock:
+            return dict(self.metrics)
+
+    def _send_datagram(self, packet, address):
+        self.sock.sendto(packet, address)
+        self.metrics['packets_out'] += 1
+        self.metrics['bytes_out'] += len(packet)
+
     def _packet(self, peer, kind, payload):
         peer.sequence += 1
         header = HEADER.pack(b'NC', kind, uuid.UUID(peer.session).bytes, peer.sequence)
         nonce = peer.sequence.to_bytes(12, 'big')
         packet = header + peer.cipher.encrypt(nonce, payload, header)
-        self.sock.sendto(packet, peer.address)
+        self._send_datagram(packet, peer.address)
+        if kind == 1:
+            self.metrics['acks_out'] += 1
         return packet, peer.sequence
 
     def _read(self, packet, address):
@@ -98,6 +111,7 @@ class Transport:
         if kind == 1:
             if len(data) != 8:
                 return
+            self.metrics['acks_in'] += 1
             item = peer.pending.pop(struct.unpack('!Q', data)[0], None)
             if item:
                 elapsed = time.monotonic() - peer.epoch
@@ -121,6 +135,8 @@ class Transport:
             try:
                 packet, address = self.sock.recvfrom(MAX_PACKET + 1)
                 with self.lock:
+                    self.metrics['packets_in'] += 1
+                    self.metrics['bytes_in'] += len(packet)
                     self._read(packet, address)
             except (socket.timeout, ValueError, queue.Full):
                 pass
@@ -141,9 +157,10 @@ class Transport:
                             peer.backlog.clear()
                             self.events.put((peer, None))
                             break
-                        self.sock.sendto(packet, peer.address)
+                        self._send_datagram(packet, peer.address)
                         peer.pending[seq] = packet, now, retries + 1
                         peer.retransmissions += 1
+                        self.metrics['retransmissions'] += 1
                         peer.maximum = peer.cwnd
                         peer.cwnd = max(2, peer.cwnd * .7)
                         peer.epoch = now

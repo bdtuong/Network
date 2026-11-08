@@ -1,4 +1,27 @@
-# Latest validation: transfer and shutdown race conditions
+# Latest validation: authenticated dashboard, receiver-ACK progress and accurate telemetry
+
+Full command: `.venv312/bin/python -m pytest -q -W error`. Observed result on macOS / Python 3.12:
+
+```text
+...........................................                              [100%]
+43 passed in 97.97s (0:01:37)
+```
+
+Focused dashboard/progress/UI/impairment checks passed: `9 passed in 12.28s`. After the final CLI cleanup adjustment, both startup/shutdown cases passed again: `2 passed in 0.89s`. Python compileall, JavaScript syntax checks (including the dashboard's inline script), and git diff whitespace checks passed.
+
+New checks in test_dashboard.py exercise real loopback HTTP/TCP/UDP sockets:
+
+- Missing/wrong tokens, foreign Origin and unexpected Host return 403 without telemetry or CORS permission; a valid token/same-origin request succeeds. Root HTML is static; the data API is protected. The listener is 127.0.0.1.
+- UDP socket counters, ACK RX/TX and retransmission counts increase during delivered messaging with a deliberately dropped outbound DATA datagram. Chat text does not appear in server logs.
+- Occupying the dashboard port produces a warning while the core still accepts TCP HELLO. Normal exit closes both services; repeated dashboard close is safe.
+
+New test_progress.py checks hold a FILE_CHUNK in server dispatch: Alice does not report 100% while Bob has received no bytes. Releasing the chunk lets FILE_ACK drive progress and FILE_RESULT drive verified status. Empty and 700-byte files verify successfully and stay within 0-100%. The JavaScript suite now has seven cases, including the distinction between 100% received/awaiting verification and Verified.
+
+Metric definitions: packets/bytes count UDP socket reads and successful sendto calls, including ACKs, duplicates and retransmissions; byte counts exclude UDP/IP headers. Socket send success does not prove remote receipt. Separate records_in/record_bytes_in count application dispatch. The dashboard labels CUBIC-inspired and displays configured server inactivity rather than confusing it with heartbeat frequency or client timeout.
+
+No browser automation or Windows execution was performed in this update. Restart the server and all Python bridges to load the changes, reopen the complete terminal token URLs, and rerun the same suite on Windows. Existing accounts and received files are unchanged. No new dependencies were added.
+
+## Previous transfer/shutdown race validation
 
 Command: `.venv312/bin/python -m pytest -q -W error`. Actual result on macOS / Python 3.12:
 

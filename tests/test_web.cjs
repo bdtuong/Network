@@ -118,3 +118,19 @@ test('sender keeps hello after thousands of file ACKs and progress updates', () 
     vm.runInContext("selected = 'Bob'; render();", context);
     assert.equal(elements.get('messages').children[0].children[1].textContent, 'hello');
 });
+
+
+test('100 percent received is labelled pending verification until FILE_RESULT', () => {
+    const {context, elements} = frontend();
+    context.inputEvents = [{type: 'PROGRESS', id: 'file', conversation: 'Bob',
+                            name: 'file.pdf', progress: 1, phase: 'received'}];
+    vm.runInContext("selected = 'Bob'; appendEvents(inputEvents); render();", context);
+    assert.match(elements.get('messages').children[0].children[1].textContent, /awaiting verification/);
+    context.inputEvents = [{type: 'FILE_RESULT', id: 'file', conversation: 'Bob',
+                            name: 'file.pdf', success: true}];
+    vm.runInContext('appendEvents(inputEvents); render();', context);
+    const cards = elements.get('messages').children;
+    assert.match(cards[0].children[1].textContent, /verified/);
+    assert.doesNotMatch(cards[0].children[1].textContent, /awaiting verification/);
+    assert.match(cards[1].children[1].textContent, /Verified/);
+});

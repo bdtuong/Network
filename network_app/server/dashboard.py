@@ -1,6 +1,7 @@
 """Lightweight Real-time Web Dashboard Monitor for Server using standard Python http.server."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import secrets
 import threading
 import time
 
@@ -411,7 +412,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="header-actions">
         <button class="theme-toggle" id="theme-btn" onclick="toggleTheme()">☀️ Light Mode</button>
-        <div class="badge pulse-green"><span class="pulse-dot"></span> LIVE SYSTEM ACTIVE</div>
+        <div class="badge pulse-green"><span class="pulse-dot"></span> <span id="dashboard-state">CONNECTING</span></div>
         <div class="badge">TCP: <strong id="val-tcpport" style="color:var(--accent-blue)">9000</strong></div>
         <div class="badge">UDP: <strong id="val-udpport" style="color:var(--accent-purple)">9000</strong></div>
         <div class="badge">UPTIME: <strong id="val-uptime" style="color:var(--text-primary)">00:00:00</strong></div>
@@ -426,14 +427,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span class="metric-sub" id="val-users-list">No users connected</span>
     </div>
     <div class="metric-card">
-        <span class="metric-label">📦 RUDP Packets Routed</span>
-        <span class="metric-value" id="val-packets-in" style="color:var(--accent-green)">0</span>
-        <span class="metric-sub">Reliable UDP Datagrams (Max 1200B)</span>
+        <span class="metric-label">📦 UDP Datagrams RX / TX</span>
+        <span class="metric-value" style="color:var(--accent-green)"><span id="val-packets-in">0</span> / <span id="val-packets-out">0</span></span>
+        <span class="metric-sub">ACK RX/TX: <span id="val-acks">0 / 0</span> · Retries: <span id="val-retries">0</span><br>UDP payload bytes RX/TX: <span id="val-bytes">0 / 0</span></span>
     </div>
     <div class="metric-card">
-        <span class="metric-label">⚡ TCP Sessions Handled</span>
+        <span class="metric-label">⚡ TCP Connections Accepted</span>
         <span class="metric-value" id="val-tcp-conns" style="color:var(--accent-yellow)">0</span>
-        <span class="metric-sub">Control Plane Handshakes</span>
+        <span class="metric-sub">Includes failed/unfinished logins</span>
     </div>
     <div class="metric-card">
         <span class="metric-label">🛡️ Security Stack</span>
@@ -459,14 +460,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <div class="proto-box">
             <div class="proto-title">📐 Protocol Specifications & Rubric Mapping</div>
-            <div class="proto-item"><span class="proto-key">MAX_PACKET (UDP Datagram):</span><span class="proto-val" style="color:var(--accent-blue)">1200 Bytes</span></div>
+            <div class="proto-item"><span class="proto-key">MAX_PACKET (UDP payload):</span><span class="proto-val" style="color:var(--accent-blue)">1200 Bytes</span></div>
             <div class="proto-item"><span class="proto-key">Fixed RUDP Header:</span><span class="proto-val">27 Bytes (!2sB16sQ)</span></div>
             <div class="proto-item"><span class="proto-key">AES-GCM Auth Tag:</span><span class="proto-val">16 Bytes (AAD Protected)</span></div>
-            <div class="proto-item"><span class="proto-key">File CHUNK Size:</span><span class="proto-val" style="color:var(--accent-green)">512 Bytes (Base64 -> 683B)</span></div>
+            <div class="proto-item"><span class="proto-key">File CHUNK Size:</span><span class="proto-val" style="color:var(--accent-green)">512 Bytes (Base64 -> 684B)</span></div>
             <div class="proto-item"><span class="proto-key">Flow Control Window:</span><span class="proto-val">16 Chunks (In-flight credit)</span></div>
-            <div class="proto-item"><span class="proto-key">Congestion Control:</span><span class="proto-val">CUBIC (cwnd 4 -> 32)</span></div>
-            <div class="proto-item"><span class="proto-key">PBKDF2 Iterations:</span><span class="proto-val" style="color:var(--accent-yellow)">600,000 Iterations (OWASP)</span></div>
-            <div class="proto-item"><span class="proto-key">Inactivity Timeout:</span><span class="proto-val">20s Heartbeat / 45s File Cleanup</span></div>
+            <div class="proto-item"><span class="proto-key">Congestion Control:</span><span class="proto-val">CUBIC-inspired (cwnd 4 -> 32)</span></div>
+            <div class="proto-item"><span class="proto-key">PBKDF2 Iterations:</span><span class="proto-val" style="color:var(--accent-yellow)">600,000 Iterations</span></div>
+            <div class="proto-item"><span class="proto-key">Inactivity Timeout:</span><span class="proto-val">Heartbeat every ~1s; server expiry <span id="val-session-timeout">15</span>s; client wait 20s; file cleanup 45s</span></div>
         </div>
     </div>
 
@@ -493,6 +494,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
+    const suppliedToken = location.hash.slice(1);
+    if (suppliedToken) sessionStorage.setItem('relay-dashboard-token', suppliedToken);
+    const dashboardToken = suppliedToken || sessionStorage.getItem('relay-dashboard-token') || '';
+    history.replaceState(null, '', location.pathname);
+    let fetching = false;
     let activeFilter = 'ALL';
     let currentTheme = localStorage.getItem('noc_theme') || 'light';
 
@@ -524,9 +530,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     async function fetchData() {
+        if (fetching) return;
+        fetching = true;
         try {
-            const res = await fetch('/api/data');
-            if (!res.ok) return;
+            const res = await fetch('/api/data', {headers: {'X-Token': dashboardToken}});
+            if (!res.ok) {
+                document.getElementById('dashboard-state').textContent = 'ACCESS DENIED: OPEN THE TERMINAL URL';
+                return;
+            }
+            document.getElementById('dashboard-state').textContent = 'LIVE SYSTEM ACTIVE';
             const data = await res.json();
 
             // 1. Update Header Badges & Metrics
@@ -540,6 +552,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             const userNames = data.users.map(u => u.username).join(', ');
             document.getElementById('val-users-list').textContent = userNames ? `Online: ${userNames}` : 'No users connected';
             document.getElementById('val-packets-in').textContent = (data.stats.packets_in || 0).toLocaleString();
+            document.getElementById('val-packets-out').textContent = (data.stats.packets_out || 0).toLocaleString();
+            document.getElementById('val-acks').textContent = `${data.stats.acks_in || 0} / ${data.stats.acks_out || 0}`;
+            document.getElementById('val-retries').textContent = data.stats.retransmissions || 0;
+            document.getElementById('val-bytes').textContent = `${data.stats.bytes_in || 0} / ${data.stats.bytes_out || 0}`;
+            document.getElementById('val-session-timeout').textContent = data.session_timeout;
             document.getElementById('val-tcp-conns').textContent = (data.stats.tcp_conns || 0).toLocaleString();
 
             // 2. Render Sessions List
@@ -557,7 +574,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                             <span>TCP: <strong>${u.ip}:${u.tcp_port}</strong></span>
                             <span>UDP: <strong>${u.ip}:${u.udp_port}</strong></span>
                             <span>Congestion cwnd: <strong>${u.cwnd} pkts</strong></span>
-                            <span>Heartbeat: <strong>${u.last_seen}s ago</strong></span>
+                            <span>Last UDP activity: <strong>${u.last_seen}s ago</strong></span>
                         </div>
                         <div class="session-uuid" title="Full Session UUID: ${u.full_session}">
                             UUID: ${u.session}
@@ -584,9 +601,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 if (document.getElementById('autoscroll-chk').checked) {
                     logBox.scrollTop = logBox.scrollHeight;
                 }
+            } else {
+                logBox.innerHTML = '<div class="empty-hint">No events for this filter.</div>';
             }
         } catch (e) {
+            document.getElementById('dashboard-state').textContent = 'SERVER UNREACHABLE';
             console.error('Telemetry fetch error:', e);
+        } finally {
+            fetching = false;
         }
     }
 
@@ -605,44 +627,71 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        # Silence default HTTP server access logs so terminal stays clean
+    def log_message(self, *args):
         pass
 
+    def reply(self, status, body, content_type='application/json'):
+        if content_type == 'application/json':
+            body = json.dumps(body).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Content-Security-Policy',
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                         "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        expected_host = f'127.0.0.1:{self.server.server_port}'
+        if self.headers.get('Host') != expected_host:
+            return self.reply(403, {'error': 'Forbidden'})
         if self.path == '/api/data':
-            try:
-                data = self.server.app_server.get_dashboard_data()
-                body = json.dumps(data).encode('utf-8')
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(body)))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(str(e).encode())
-        else:
-            body = DASHBOARD_HTML.encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            origin = self.headers.get('Origin')
+            if (origin not in (None, 'http://' + expected_host) or not secrets.compare_digest(
+                    self.headers.get('X-Token', ''), self.server.token)):
+                return self.reply(403, {'error': 'Forbidden'})
+            return self.reply(200, self.server.app_server.get_dashboard_data())
+        if self.path != '/':
+            return self.reply(404, {'error': 'Not found'})
+        self.reply(200, DASHBOARD_HTML.encode('utf-8'), 'text/html; charset=utf-8')
 
 
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, host, port, app_server):
+        if host != '127.0.0.1':
+            raise ValueError('Dashboard must bind to 127.0.0.1')
         self.app_server = app_server
+        self.token = secrets.token_urlsafe(32)
+        self._close_lock = threading.Lock()
+        self._closed = False
         super().__init__((host, port), DashboardHandler)
+
+    @property
+    def url(self):
+        return f'http://127.0.0.1:{self.server_port}/#{self.token}'
+
+    def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.shutdown()
+            self.server_close()
+            self.thread.join(2)
 
 
 def start_dashboard(app_server, host='127.0.0.1', port=9001):
     server = DashboardServer(host, port, app_server)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    server.thread = threading.Thread(target=server.serve_forever, daemon=True)
+    try:
+        server.thread.start()
+    except Exception:
+        server.server_close()
+        raise
     return server

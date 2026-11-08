@@ -21,6 +21,14 @@ Windows: use `py -3.11 -m venv .venv` and `.venv\Scripts\activate` instead. This
 python -m network_app.server --host 127.0.0.1 --port 9000
 ```
 
+## Server dashboard (loopback only)
+
+The server also starts an optional dashboard on port 9001. Open the **full dashboard URL including its random `#token`** printed in the terminal, for example `http://127.0.0.1:9001/#...`. The dashboard always binds to 127.0.0.1 even if the chat server uses `--host 0.0.0.0` for LAN clients. Its data API requires the token and matching Host/Origin, has no wildcard CORS, and does not include chat message contents in logs. The token is kept only in the current tab's sessionStorage so refresh works; after server restart open the new terminal URL.
+
+Choose another dashboard port with `--dashboard 9002`, disable it with `--dashboard 0`, or reduce console logging with `--no-verbose`. If the dashboard port is occupied/unavailable, the core TCP/UDP server continues running and prints a warning. Normal shutdown closes both services.
+
+RX/TX and byte counters come from UDP socket receive/send operations, include packet ACKs, duplicates and retransmissions, and exclude OS-level UDP/IP headers. ACK RX/TX and retry counters are displayed separately. Application record counters are separate from datagram counts. These are application/socket metrics, not a packet capture or confirmation that every sent datagram reached the remote machine. The dashboard labels the controller CUBIC-inspired and distinguishes ~1s heartbeats, the configured server inactivity limit (default 15s), client wait (20s), and file cleanup (45s).
+
 ## Start three independent browser clients
 
 Run each command in a separate terminal with the environment activated:
@@ -38,7 +46,7 @@ These commands are the client entry points; a terminal chat UI is not included.
 1. Confirm all three clients show three online users.
 2. Select Global and send a message as Alice; Bob and Charlie should receive it.
 3. Select Bob as Alice and send a private message. Select Alice as Bob to see it; Charlie should not receive it.
-4. Select Bob, choose a file and click Send file. Bob sees receive progress and final SHA-256 verification. Both parties receive FILE_RESULT. File progress updates reuse one progress item per transfer, so control packets and repeated progress updates do not crowd earlier chat messages out of the browser history. File offers, progress, completion and transfer errors are scoped to the private conversation with the other participant; they do not appear in Global chat or another person's conversation. Received files are in Bob's local downloads directory with a transfer UUID prefix.
+4. Select Bob, choose a file and click Send file. Alice's progress counts bytes confirmed by Bob's FILE_ACKs; Bob sees receive progress. A sender value of 100% means all file bytes were acknowledged by the receiver and is labelled awaiting verification until FILE_RESULT. Empty files reach 100% on the successful result. Only Verified confirms SHA-256 verification. Both parties receive FILE_RESULT. File progress updates reuse one progress item per transfer, so control packets and repeated progress updates do not crowd earlier chat messages out of the browser history. File offers, progress, completion and transfer errors are scoped to the private conversation with the other participant; they do not appear in Global chat or another person's conversation. Received files are in Bob's local downloads directory with a transfer UUID prefix.
 5. Terminate Charlie's bridge (Ctrl-C for graceful exit, process termination for abrupt exit). Alice/Bob should update their online lists and continue chatting.
 6. Run the impairment test below for a reproducible real-socket retransmission demonstration. No fake loss logs are produced.
 7. Security tests demonstrate binary AES-GCM round trips, ciphertext tampering rejection and directional key separation. Encrypted transport means plaintext message content should not appear in UDP packet captures.
