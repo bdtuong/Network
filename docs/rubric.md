@@ -12,7 +12,7 @@ Status describes implementation and automated local evidence, not an instructor'
 | 6 | Reliable UDP file transfer | chunks, selective repeat, receiver credits, disk reassembly, SHA-256 | empty/37-byte/65,539-byte/10,485,791-byte files; deterministic impairment | Verified locally |
 | 7 | Resilience | heartbeat expiry, bounded retry/backoff, EOF/logout, cleanup | abrupt disconnect, shutdown, retry exhaustion, inactivity tests | Verified locally |
 | 8 | Encryption | X25519/HKDF, directional AES-GCM, authenticated headers, replay dedup | binary crypto, tamper rejection, replay tests; encrypted integration traffic | Verified locally; trusted LAN assumption |
-| 9 | HTTP/JavaScript UI | `webui.py`, `web/`; login, people, chat, file progress/results | HTTP assets/API/auth tests; three-port demo in README | Implemented; HTTP and single-client browser smoke verified; three-browser/LAN demonstration pending |
+| 9 | HTTP/JavaScript UI | `webui.py`, `web/`, loopback token-protected server dashboard; login, people, receiver-ACK progress/results and transport metrics | HTTP assets/API/auth tests; three-port demo in README | Implemented; HTTP and single-client browser smoke verified; three-browser/LAN demonstration pending |
 | 10 | Testing and quality | `tests/`, modular implementation, `docs/testing.md` | pytest with warnings as errors, compile checks | See actual final test log |
 
 Milestone 1 asks for documentation before coding. The protocol decisions were established before implementation, but the detailed Markdown specification was written alongside implementation. No historical before-coding artifact or Git commit is claimed.

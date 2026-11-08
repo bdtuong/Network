@@ -60,6 +60,14 @@ function appendEvents(events) {
         if (!['GLOBAL_MESSAGE', 'PRIVATE_MESSAGE', 'FILE_OFFER', 'FILE_RESULT', 'PROGRESS', 'ERROR'].includes(event.type)) {
             continue;
         }
+        if (event.type === 'FILE_RESULT') {
+            for (const item of historyEvents) {
+                if (item.type === 'PROGRESS' && item.id === event.id && item.conversation === event.conversation) {
+                    item.phase = event.success ? 'verified' : 'failed';
+                    if (event.success) item.progress = 1;
+                }
+            }
+        }
         if (event.type === 'PROGRESS') {
             const previous = historyEvents.findIndex(item =>
                 item.type === 'PROGRESS' && item.id === event.id &&
@@ -89,7 +97,7 @@ function render() {
             event.type === 'FILE_RESULT'
                 ? `${event.success ? 'Verified ✓' : 'Integrity check failed'} · ${event.name}`
                 : event.type === 'PROGRESS'
-                    ? `${event.name} · ${Math.round(event.progress * 100)}%`
+                    ? `${event.name} · ${Math.round(event.progress * 100)}%${event.phase === 'received' && event.progress === 1 ? ' received · awaiting verification' : event.phase === 'verified' ? ' · verified' : ''}`
                     : `${event.type} · ${event.name || ''}`
         );
         article.append(content);

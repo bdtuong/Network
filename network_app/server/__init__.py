@@ -23,10 +23,8 @@ class Server:
         self.logs = collections.deque(maxlen=300)
         self.stats = {
             'tcp_conns': 0,
-            'packets_in': 0,
-            'packets_out': 0,
-            'bytes_in': 0,
-            'bytes_out': 0,
+            'records_in': 0,
+            'record_bytes_in': 0,
             'start_time': time.time()
         }
         self.users = {}
@@ -38,6 +36,7 @@ class Server:
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
+        self._port = self.sock.getsockname()[1]
         self.sock.listen(64)
         self.sock.settimeout(.2)
         self.transport = Transport((host, self.sock.getsockname()[1]), self.route, server=True)
@@ -73,10 +72,12 @@ class Server:
                     'last_seen': round(time.monotonic() - getattr(p, 'last_seen', time.monotonic()), 1)
                 })
             rev = self.revision
+            stats = dict(self.stats)
         with self.log_lock:
             recent_logs = list(self.logs)
 
-        elapsed = int(time.time() - self.stats['start_time'])
+        stats.update(self.transport.snapshot_metrics())
+        elapsed = int(time.time() - stats['start_time'])
         h = elapsed // 3600
         m = (elapsed % 3600) // 60
         s = elapsed % 60
@@ -88,13 +89,14 @@ class Server:
             'udp_port': self.port,
             'revision': rev,
             'users': users_list,
-            'stats': dict(self.stats),
+            'stats': stats,
+            'session_timeout': self.timeout,
             'logs': recent_logs
         }
 
     @property
     def port(self):
-        return self.sock.getsockname()[1]
+        return self._port
 
     def _accept(self):
         while self.running:
@@ -123,7 +125,7 @@ class Server:
             challenge = secrets.token_hex(12)
             send(conn, {'type': 'HELLO', 'version': 2,
                         'public_key': public, 'challenge': challenge})
-            self.log('HANDSHAKE', f'Sent HELLO v2 -> Challenge: {challenge[:8]}... | Server X25519 PubKey ({len(public)}B)')
+            self.log('HANDSHAKE', f'Sent HELLO v2 -> Challenge: {challenge[:8]}... | Server X25519 PubKey ({len(public) // 2}B)')
             request = receive(conn)
             candidate = request.get('username', '')
             if request.get('type') != 'AUTH' or not re.fullmatch(r'[A-Za-z0-9_-]{1,24}', candidate):
@@ -131,7 +133,7 @@ class Server:
             port = request['udp_port']
             if type(port) is not int or not 1 <= port <= 65535:
                 raise ValueError('Invalid UDP port')
-            self.log('HANDSHAKE', f'Received AUTH from user="{candidate}" | UDP Port: {port} | Client PubKey ({len(request.get("public_key", b""))}B)')
+            self.log('HANDSHAKE', f'Received AUTH from user="{candidate}" | UDP Port: {port} | Client PubKey ({len(request.get("public_key", b""))} hex chars)')
             key = derive(private, request['public_key'])
             self.log('CRYPTO', f'Derived 256-bit AES shared key via ECDH (X25519) + HKDF-SHA256 for "{candidate}"')
             password = open_password(key, challenge, candidate, port, request['password'])
@@ -197,14 +199,14 @@ class Server:
 
     def route(self, peer, data):
         request = json.loads(data)
-        self.stats['packets_in'] += 1
-        self.stats['bytes_in'] += len(data)
         with self.lock:
             if not self.running:
                 return
             sender = next((n for n, u in self.users.items() if u['peer'] is peer), None)
             if not sender:
                 return
+            self.stats['records_in'] += 1
+            self.stats['record_bytes_in'] += len(data)
             kind = request.get('type')
             if kind == 'HEARTBEAT':
                 self.transport.send(peer, encode({'type': 'HEARTBEAT'}))
@@ -218,7 +220,7 @@ class Server:
             request['timestamp'] = time.time()
             if kind == 'GLOBAL_MESSAGE':
                 targets = list(self.users.values())
-                self.log('ROUTING', f'GLOBAL_MESSAGE from "{sender}": "{request.get("text", "")[:32]}" -> Broadcasted')
+                self.log('ROUTING', f'GLOBAL_MESSAGE from "{sender}" -> queued for {len(targets)} client(s)')
             else:
                 target = self.users.get(request.get('recipient'))
                 if not target:
@@ -236,7 +238,7 @@ class Server:
                 elif kind == 'FILE_CHUNK':
                     idx = request.get('index', 0)
                     if idx == 0 or idx % 25 == 0:
-                        self.log('FILE', f'FILE_CHUNK #{idx} from "{sender}" -> "{request.get("recipient")}" (512B raw / ~836B UDP)')
+                        self.log('FILE', f'FILE_CHUNK #{idx} from "{sender}" -> "{request.get("recipient")}" (chunk payload; datagram sizes counted by UDP transport)')
                 elif kind == 'FILE_COMPLETE':
                     self.log('FILE', f'FILE_COMPLETE from "{sender}" -> "{request.get("recipient")}"')
                 elif kind == 'FILE_RESULT':
